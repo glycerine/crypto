@@ -8,6 +8,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	crypto_rand "crypto/rand"
 	"errors"
 	"io"
@@ -28,10 +29,16 @@ func dial(handler serverType, t *testing.T) *Client {
 		t.Fatalf("netPipe: %v", err)
 	}
 
+	ctx, cancelctx := context.WithCancel(context.Background())
+
 	go func() {
 		defer c1.Close()
 		conf := ServerConfig{
 			NoClientAuth: true,
+			Config: Config{
+				Ctx:       ctx,
+				CancelCtx: cancelctx,
+			},
 		}
 		conf.AddHostKey(testSigners["rsa"])
 
@@ -39,7 +46,7 @@ func dial(handler serverType, t *testing.T) *Client {
 		if err != nil {
 			t.Fatalf("Unable to handshake: %v", err)
 		}
-		go DiscardRequests(reqs)
+		go DiscardRequests(reqs, ctx)
 
 		for newCh := range chans {
 			if newCh.ChannelType() != "session" {
@@ -61,6 +68,10 @@ func dial(handler serverType, t *testing.T) *Client {
 	config := &ClientConfig{
 		User:            "testuser",
 		HostKeyCallback: InsecureIgnoreHostKey(),
+		Config: Config{
+			Ctx:       ctx,
+			CancelCtx: cancelctx,
+		},
 	}
 
 	conn, chans, reqs, err := NewClientConn(c2, "", config)
@@ -652,7 +663,7 @@ func TestSessionID(t *testing.T) {
 			t.Fatalf("server handshake: %v", err)
 		}
 		serverID <- conn.SessionID()
-		go DiscardRequests(reqs)
+		go DiscardRequests(reqs, context.TODO())
 		for ch := range chans {
 			ch.Reject(Prohibited, "")
 		}
@@ -664,7 +675,7 @@ func TestSessionID(t *testing.T) {
 			t.Fatalf("client handshake: %v", err)
 		}
 		clientID <- conn.SessionID()
-		go DiscardRequests(reqs)
+		go DiscardRequests(reqs, context.TODO())
 		for ch := range chans {
 			ch.Reject(Prohibited, "")
 		}

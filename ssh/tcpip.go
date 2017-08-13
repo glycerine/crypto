@@ -182,61 +182,70 @@ func parseTCPAddr(addr string, port uint32) (*net.TCPAddr, error) {
 	return &net.TCPAddr{IP: ip, Port: int(port)}, nil
 }
 
-func (l *forwardList) handleChannels(in <-chan NewChannel) {
-	for ch := range in {
-		var (
-			laddr net.Addr
-			raddr net.Addr
-			err   error
-		)
-		switch channelType := ch.ChannelType(); channelType {
-		case "forwarded-tcpip":
-			var payload forwardedTCPPayload
-			if err = Unmarshal(ch.ExtraData(), &payload); err != nil {
-				ch.Reject(ConnectionFailed, "could not parse forwarded-tcpip payload: "+err.Error())
-				continue
-			}
+func (l *forwardList) handleChannels(in <-chan NewChannel, conn Conn) {
+	var ch NewChannel
+	for {
+		select {
+		case <-conn.Done():
+			return
+		case ch = <-in:
+			var (
+				laddr net.Addr
+				raddr net.Addr
+				err   error
+			)
+			switch channelType := ch.ChannelType(); channelType {
+			case "forwarded-tcpip":
+				var payload forwardedTCPPayload
+				if err = Unmarshal(ch.ExtraData(), &payload); err != nil {
+					ch.Reject(ConnectionFailed, "could not parse forwarded-tcpip payload: "+err.Error())
+					continue
+				}
 
-			// RFC 4254 section 7.2 specifies that incoming
-			// addresses should list the address, in string
-			// format. It is implied that this should be an IP
-			// address, as it would be impossible to connect to it
-			// otherwise.
-			laddr, err = parseTCPAddr(payload.Addr, payload.Port)
+				// RFC 4254 section 7.2 specifies that incoming
+				// addresses should list the address, in string
+				// format. It is implied that this should be an IP
+				// address, as it would be impossible to connect to it
+				// otherwise.
+				laddr, err = parseTCPAddr(payload.Addr, payload.Port)
+				if err != nil {
+					ch.Reject(ConnectionFailed, err.Error())
+					continue
+				}
+				raddr, err = parseTCPAddr(payload.OriginAddr, payload.OriginPort)
+				if err != nil {
+					ch.Reject(ConnectionFailed, err.Error())
+					continue
+				}
+
+			case "forwarded-streamlocal@openssh.com":
+				var payload forwardedStreamLocalPayload
+				if err = Unmarshal(ch.ExtraData(), &payload); err != nil {
+					ch.Reject(ConnectionFailed, "could not parse forwarded-streamlocal@openssh.com payload: "+err.Error())
+					continue
+				}
+				laddr = &net.UnixAddr{
+					Name: payload.SocketPath,
+					Net:  "unix",
+				}
+				raddr = &net.UnixAddr{
+					Name: "@",
+					Net:  "unix",
+				}
+			default:
+				panic(fmt.Errorf("ssh: unknown channel type %s", channelType))
+			}
+			ok, err := l.forward(laddr, raddr, ch, conn)
 			if err != nil {
-				ch.Reject(ConnectionFailed, err.Error())
+				return
+			}
+			if !ok {
+				// Section 7.2, implementations MUST reject spurious incoming
+				// connections.
+				ch.Reject(Prohibited, "no forward for address")
 				continue
 			}
-			raddr, err = parseTCPAddr(payload.OriginAddr, payload.OriginPort)
-			if err != nil {
-				ch.Reject(ConnectionFailed, err.Error())
-				continue
-			}
-
-		case "forwarded-streamlocal@openssh.com":
-			var payload forwardedStreamLocalPayload
-			if err = Unmarshal(ch.ExtraData(), &payload); err != nil {
-				ch.Reject(ConnectionFailed, "could not parse forwarded-streamlocal@openssh.com payload: "+err.Error())
-				continue
-			}
-			laddr = &net.UnixAddr{
-				Name: payload.SocketPath,
-				Net:  "unix",
-			}
-			raddr = &net.UnixAddr{
-				Name: "@",
-				Net:  "unix",
-			}
-		default:
-			panic(fmt.Errorf("ssh: unknown channel type %s", channelType))
 		}
-		if ok := l.forward(laddr, raddr, ch); !ok {
-			// Section 7.2, implementations MUST reject spurious incoming
-			// connections.
-			ch.Reject(Prohibited, "no forward for address")
-			continue
-		}
-
 	}
 }
 
@@ -264,16 +273,20 @@ func (l *forwardList) closeAll() {
 	l.entries = nil
 }
 
-func (l *forwardList) forward(laddr, raddr net.Addr, ch NewChannel) bool {
+func (l *forwardList) forward(laddr, raddr net.Addr, ch NewChannel, conn Conn) (bool, error) {
 	l.Lock()
 	defer l.Unlock()
 	for _, f := range l.entries {
 		if laddr.Network() == f.laddr.Network() && laddr.String() == f.laddr.String() {
-			f.c <- forward{newCh: ch, raddr: raddr}
-			return true
+			select {
+			case f.c <- forward{newCh: ch, raddr: raddr}:
+				return true, nil
+			case <-conn.Done():
+				return false, io.EOF
+			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 type tcpListener struct {
@@ -285,15 +298,21 @@ type tcpListener struct {
 
 // Accept waits for and returns the next connection to the listener.
 func (l *tcpListener) Accept() (net.Conn, error) {
-	s, ok := <-l.in
-	if !ok {
+	var ok bool
+	var s forward
+	select {
+	case <-l.conn.Done():
 		return nil, io.EOF
+	case s, ok = <-l.in:
+		if !ok {
+			return nil, io.EOF
+		}
 	}
 	ch, incoming, err := s.newCh.Accept()
 	if err != nil {
 		return nil, err
 	}
-	go DiscardRequests(incoming)
+	go DiscardRequests(incoming, l.conn.Ctx)
 
 	return &chanConn{
 		Channel: ch,
@@ -414,7 +433,7 @@ func (c *Client) dial(laddr string, lport int, raddr string, rport int) (Channel
 	if err != nil {
 		return nil, err
 	}
-	go DiscardRequests(in)
+	go DiscardRequests(in, c.Ctx)
 	return ch, err
 }
 

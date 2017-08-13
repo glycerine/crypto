@@ -80,7 +80,7 @@ func (b *closerBuffer) Close() error {
 
 func TestTransportMaxPacketWrite(t *testing.T) {
 	buf := &closerBuffer{}
-	tr := newTransport(buf, rand.Reader, true)
+	tr := newTransport(buf, rand.Reader, true, nil)
 	huge := make([]byte, maxPacket+1)
 	err := tr.writePacket(huge)
 	if err == nil {
@@ -99,7 +99,7 @@ func TestTransportMaxPacketReader(t *testing.T) {
 	buf.Write(header[:])
 	buf.Write(huge)
 
-	tr := newTransport(buf, rand.Reader, true)
+	tr := newTransport(buf, rand.Reader, true, nil)
 	_, err := tr.readPacket()
 	if err == nil {
 		t.Errorf("transport succeeded reading huge packet.")

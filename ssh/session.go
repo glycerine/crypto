@@ -380,7 +380,11 @@ func (s *Session) start() error {
 	s.errors = make(chan error, len(s.copyFuncs))
 	for _, fn := range s.copyFuncs {
 		go func(fn func() error) {
-			s.errors <- fn()
+			select {
+			case s.errors <- fn():
+			case <-s.ch.Done():
+				return
+			}
 		}(fn)
 	}
 	return nil
@@ -400,21 +404,31 @@ func (s *Session) Wait() error {
 	if !s.started {
 		return errors.New("ssh: session not started")
 	}
-	waitErr := <-s.exitStatus
+	select {
+	case <-s.ch.Done():
+		return io.EOF
 
-	if s.stdinPipeWriter != nil {
-		s.stdinPipeWriter.Close()
-	}
-	var copyError error
-	for _ = range s.copyFuncs {
-		if err := <-s.errors; err != nil && copyError == nil {
-			copyError = err
+	case waitErr := <-s.exitStatus:
+
+		if s.stdinPipeWriter != nil {
+			s.stdinPipeWriter.Close()
 		}
+		var copyError error
+		for _ = range s.copyFuncs {
+			select {
+			case <-s.ch.Done():
+				return io.EOF
+			case err := <-s.errors:
+				if err != nil && copyError == nil {
+					copyError = err
+				}
+			}
+		}
+		if waitErr != nil {
+			return waitErr
+		}
+		return copyError
 	}
-	if waitErr != nil {
-		return waitErr
-	}
-	return copyError
 }
 
 func (s *Session) wait(reqs <-chan *Request) error {
@@ -590,7 +604,11 @@ func newSession(ch Channel, reqs <-chan *Request) (*Session, error) {
 	}
 	s.exitStatus = make(chan error, 1)
 	go func() {
-		s.exitStatus <- s.wait(reqs)
+		select {
+		case s.exitStatus <- s.wait(reqs):
+		case <-ch.Done():
+			return
+		}
 	}()
 
 	return s, nil

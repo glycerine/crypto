@@ -47,6 +47,8 @@ type transport struct {
 	rand      io.Reader
 	isClient  bool
 	io.Closer
+
+	config *Config
 }
 
 // packetCipher represents a combination of SSH encryption/MAC
@@ -75,17 +77,26 @@ type connectionState struct {
 // prepareKeyChange sets up key material for a keychange. The key changes in
 // both directions are triggered by reading and writing a msgNewKey packet
 // respectively.
-func (t *transport) prepareKeyChange(algs *algorithms, kexResult *kexResult) error {
+func (t *transport) prepareKeyChange(algs *algorithms, kexResult *kexResult, config *Config) error {
+
 	if ciph, err := newPacketCipher(t.reader.dir, algs.r, kexResult); err != nil {
 		return err
 	} else {
-		t.reader.pendingKeyChange <- ciph
+		select {
+		case t.reader.pendingKeyChange <- ciph:
+		case <-config.Ctx.Done():
+			return io.EOF
+		}
 	}
 
 	if ciph, err := newPacketCipher(t.writer.dir, algs.w, kexResult); err != nil {
 		return err
 	} else {
-		t.writer.pendingKeyChange <- ciph
+		select {
+		case t.writer.pendingKeyChange <- ciph:
+		case <-config.Ctx.Done():
+			return io.EOF
+		}
 	}
 
 	return nil
@@ -193,7 +204,8 @@ func (s *connectionState) writePacket(w *bufio.Writer, rand io.Reader, packet []
 	return err
 }
 
-func newTransport(rwc io.ReadWriteCloser, rand io.Reader, isClient bool) *transport {
+func newTransport(rwc io.ReadWriteCloser, rand io.Reader, isClient bool,
+	config *Config) *transport {
 	t := &transport{
 		bufReader: bufio.NewReader(rwc),
 		bufWriter: bufio.NewWriter(rwc),
@@ -207,6 +219,7 @@ func newTransport(rwc io.ReadWriteCloser, rand io.Reader, isClient bool) *transp
 			pendingKeyChange: make(chan packetCipher, 1),
 		},
 		Closer: rwc,
+		config: config,
 	}
 	t.isClient = isClient
 

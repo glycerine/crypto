@@ -96,8 +96,8 @@ func handshakePair(clientConf *ClientConfig, addr string, noise bool) (client *h
 
 	var trC, trS keyingTransport
 
-	trC = newTransport(a, rand.Reader, true)
-	trS = newTransport(b, rand.Reader, false)
+	trC = newTransport(a, rand.Reader, true, &clientConf.Config)
+	trS = newTransport(b, rand.Reader, false, &clientConf.Config)
 	if noise {
 		trC = addNoiseTransport(trC)
 		trS = addNoiseTransport(trS)
@@ -225,13 +225,13 @@ func TestForceFirstKex(t *testing.T) {
 
 	var trC, trS keyingTransport
 
-	trC = newTransport(a, rand.Reader, true)
+	trC = newTransport(a, rand.Reader, true, nil)
 
 	// This is the disallowed packet:
 	trC.writePacket(Marshal(&serviceRequestMsg{serviceUserAuth}))
 
 	// Rest of the setup.
-	trS = newTransport(b, rand.Reader, false)
+	trS = newTransport(b, rand.Reader, false, nil)
 	clientConf.SetDefaults()
 
 	v := []byte("version")
@@ -365,7 +365,7 @@ type errorKeyingTransport struct {
 	readLeft, writeLeft int
 }
 
-func (n *errorKeyingTransport) prepareKeyChange(*algorithms, *kexResult) error {
+func (n *errorKeyingTransport) prepareKeyChange(*algorithms, *kexResult, *Config) error {
 	return nil
 }
 

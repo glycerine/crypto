@@ -33,7 +33,7 @@ type keyingTransport interface {
 	// prepareKeyChange sets up a key change. The key change for a
 	// direction will be effected if a msgNewKeys message is sent
 	// or received.
-	prepareKeyChange(*algorithms, *kexResult) error
+	prepareKeyChange(*algorithms, *kexResult, *Config) error
 }
 
 // handshakeTransport implements rekeying on top of a keyingTransport
@@ -111,8 +111,12 @@ func newHandshakeTransport(conn keyingTransport, config *Config, clientVersion, 
 	t.resetWriteThresholds()
 
 	// We always start with a mandatory key exchange.
-	t.requestKex <- struct{}{}
-	return t
+	select {
+	case t.requestKex <- struct{}{}:
+		return t
+	case <-t.config.Ctx.Done():
+		return nil
+	}
 }
 
 func newClientTransport(conn keyingTransport, clientVersion, serverVersion []byte, config *ClientConfig, dialAddr string, addr net.Addr) *handshakeTransport {
@@ -131,6 +135,7 @@ func newClientTransport(conn keyingTransport, clientVersion, serverVersion []byt
 }
 
 func newServerTransport(conn keyingTransport, clientVersion, serverVersion []byte, config *ServerConfig) *handshakeTransport {
+
 	t := newHandshakeTransport(conn, &config.Config, clientVersion, serverVersion)
 	t.hostKeys = config.hostKeys
 	go t.readLoop()
@@ -178,11 +183,15 @@ func (t *handshakeTransport) printPacket(p []byte, write bool) {
 }
 
 func (t *handshakeTransport) readPacket() ([]byte, error) {
-	p, ok := <-t.incoming
-	if !ok {
-		return nil, t.readError
+	select {
+	case p, ok := <-t.incoming:
+		if !ok {
+			return nil, t.readError
+		}
+		return p, nil
+	case <-t.config.Ctx.Done():
+		return nil, io.EOF
 	}
-	return p, nil
 }
 
 func (t *handshakeTransport) readLoop() {
@@ -198,7 +207,11 @@ func (t *handshakeTransport) readLoop() {
 		if p[0] == msgIgnore || p[0] == msgDebug {
 			continue
 		}
-		t.incoming <- p
+		select {
+		case t.incoming <- p:
+		case <-t.config.Ctx.Done():
+			return
+		}
 	}
 
 	// Stop writers too.
@@ -266,6 +279,8 @@ write:
 				}
 			case <-t.requestKex:
 				break
+			case <-t.config.Ctx.Done():
+				return
 			}
 
 			if !sent {
@@ -279,7 +294,11 @@ write:
 
 		if err := t.getWriteError(); err != nil {
 			if request != nil {
-				request.done <- err
+				select {
+				case request.done <- err:
+				case <-t.config.Ctx.Done():
+					return
+				}
 			}
 			break
 		}
@@ -317,7 +336,11 @@ write:
 			}
 		}
 
-		request.done <- t.writeError
+		select {
+		case request.done <- t.writeError:
+		case <-t.config.Ctx.Done():
+			return
+		}
 
 		// kex finished. Push packets that we received while
 		// the kex was in progress. Don't look at t.startKex
@@ -337,8 +360,19 @@ write:
 	// drain startKex channel. We don't service t.requestKex
 	// because nobody does blocking sends there.
 	go func() {
-		for init := range t.startKex {
-			init.done <- t.writeError
+		for {
+			select {
+			case init := <-t.startKex:
+				if init != nil {
+					select {
+					case init.done <- t.writeError:
+					case <-t.config.Ctx.Done():
+						return
+					}
+				}
+			case <-t.config.Ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -400,8 +434,16 @@ func (t *handshakeTransport) readOnePacket(first bool) ([]byte, error) {
 		done:      make(chan error, 1),
 		otherInit: p,
 	}
-	t.startKex <- &kex
-	err = <-kex.done
+	select {
+	case t.startKex <- &kex:
+		select {
+		case err = <-kex.done:
+		case <-t.config.Ctx.Done():
+			return nil, io.EOF
+		}
+	case <-t.config.Ctx.Done():
+		return nil, io.EOF
+	}
 
 	if debugHandshake {
 		log.Printf("%s exited key exchange (first %v), err %v", t.id(), firstKex, err)
@@ -550,7 +592,7 @@ func (t *handshakeTransport) enterKeyExchange(otherInitPacket []byte) error {
 		return err
 	}
 
-	// We don't send FirstKexFollows, but we handle receiving it.
+	// We don't send FirstKexFollows, but we handle receiving ti.
 	//
 	// RFC 4253 section 7 defines the kex and the agreement method for
 	// first_kex_packet_follows. It states that the guessed packet
@@ -589,7 +631,7 @@ func (t *handshakeTransport) enterKeyExchange(otherInitPacket []byte) error {
 	}
 	result.SessionID = t.sessionID
 
-	if err := t.conn.prepareKeyChange(t.algorithms, result); err != nil {
+	if err := t.conn.prepareKeyChange(t.algorithms, result, t.config); err != nil {
 		return err
 	}
 	if err = t.conn.writePacket([]byte{msgNewKeys}); err != nil {

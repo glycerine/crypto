@@ -56,7 +56,7 @@ func (c *Client) dialStreamLocal(socketPath string) (Channel, error) {
 	if err != nil {
 		return nil, err
 	}
-	go DiscardRequests(in)
+	go DiscardRequests(in, c.Ctx)
 	return ch, err
 }
 
@@ -69,15 +69,21 @@ type unixListener struct {
 
 // Accept waits for and returns the next connection to the listener.
 func (l *unixListener) Accept() (net.Conn, error) {
-	s, ok := <-l.in
-	if !ok {
+	var ok bool
+	var s forward
+	select {
+	case <-l.conn.Done():
 		return nil, io.EOF
+	case s, ok = <-l.in:
+		if !ok {
+			return nil, io.EOF
+		}
 	}
 	ch, incoming, err := s.newCh.Accept()
 	if err != nil {
 		return nil, err
 	}
-	go DiscardRequests(incoming)
+	go DiscardRequests(incoming, l.conn.Ctx)
 
 	return &chanConn{
 		Channel: ch,

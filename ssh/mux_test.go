@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"context"
 	"io"
 	"io/ioutil"
 	"sync"
@@ -14,8 +15,9 @@ import (
 func muxPair() (*mux, *mux) {
 	a, b := memPipe()
 
-	s := newMux(a)
-	c := newMux(b)
+	ctx := context.Background()
+	s := newMux(a, ctx)
+	c := newMux(b, ctx)
 
 	return s, c
 }

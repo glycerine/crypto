@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"net"
 )
@@ -69,6 +70,10 @@ type Conn interface {
 	// error causing the shutdown.
 	Wait() error
 
+	// Done can be used to await connection shutdown. The
+	// returned channel will be closed when the Conn is closed.
+	Done() <-chan struct{}
+
 	// TODO(hanwen): consider exposing:
 	//   RequestKeyChange
 	//   Disconnect
@@ -76,10 +81,20 @@ type Conn interface {
 
 // DiscardRequests consumes and rejects all requests from the
 // passed-in channel.
-func DiscardRequests(in <-chan *Request) {
-	for req := range in {
-		if req.WantReply {
-			req.Reply(false, nil)
+func DiscardRequests(in <-chan *Request, ctx context.Context) {
+
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+	for {
+		select {
+		case req := <-in:
+			if req != nil && req.WantReply {
+				req.Reply(false, nil)
+			}
+		case <-done:
+			return
 		}
 	}
 }
@@ -89,12 +104,21 @@ type connection struct {
 	transport *handshakeTransport
 	sshConn
 
+	// clean shutdown mechanism
+	ctx       context.Context
+	cancelctx context.CancelFunc
+
 	// The connection protocol.
 	*mux
 }
 
 func (c *connection) Close() error {
+	c.cancelctx()
 	return c.sshConn.conn.Close()
+}
+
+func (c *connection) Done() <-chan struct{} {
+	return c.ctx.Done()
 }
 
 // sshconn provides net.Conn metadata, but disallows direct reads and

@@ -6,6 +6,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +18,8 @@ import (
 // subprocesses, TCP port/streamlocal forwarding and tunneled dialing.
 type Client struct {
 	Conn
+	Ctx       context.Context
+	CtxCancel context.CancelFunc
 
 	forwards        forwardList // forwarded tcpip connections from the remote side
 	mu              sync.Mutex
@@ -59,8 +62,8 @@ func NewClient(c Conn, chans <-chan NewChannel, reqs <-chan *Request) *Client {
 		conn.Wait()
 		conn.forwards.closeAll()
 	}()
-	go conn.forwards.handleChannels(conn.HandleChannelOpen("forwarded-tcpip"))
-	go conn.forwards.handleChannels(conn.HandleChannelOpen("forwarded-streamlocal@openssh.com"))
+	go conn.forwards.handleChannels(conn.HandleChannelOpen("forwarded-tcpip"), c)
+	go conn.forwards.handleChannels(conn.HandleChannelOpen("forwarded-streamlocal@openssh.com"), c)
 	return conn
 }
 
@@ -76,14 +79,18 @@ func NewClientConn(c net.Conn, addr string, config *ClientConfig) (Conn, <-chan 
 	}
 
 	conn := &connection{
-		sshConn: sshConn{conn: c},
+		sshConn:   sshConn{conn: c},
+		ctx:       fullConf.Ctx,
+		cancelctx: fullConf.CancelCtx,
 	}
 
+	// can block on conn here, we need to get a close
+	// on conn in.
 	if err := conn.clientHandshake(addr, &fullConf); err != nil {
 		c.Close()
 		return nil, nil, nil, fmt.Errorf("ssh: handshake failed: %v", err)
 	}
-	conn.mux = newMux(conn.transport)
+	conn.mux = newMux(conn.transport, conn.ctx)
 	return conn, conn.mux.incomingChannels, conn.mux.incomingRequests, nil
 }
 
@@ -102,7 +109,7 @@ func (c *connection) clientHandshake(dialAddress string, config *ClientConfig) e
 	}
 
 	c.transport = newClientTransport(
-		newTransport(c.sshConn.conn, config.Rand, true /* is client */),
+		newTransport(c.sshConn.conn, config.Rand, true /* is client */, &config.Config),
 		c.clientVersion, c.serverVersion, config, dialAddress, c.sshConn.RemoteAddr())
 	if err := c.transport.waitSession(); err != nil {
 		return err
@@ -134,27 +141,59 @@ func (c *Client) NewSession() (*Session, error) {
 }
 
 func (c *Client) handleGlobalRequests(incoming <-chan *Request) {
-	for r := range incoming {
-		// This handles keepalive messages and matches
-		// the behaviour of OpenSSH.
-		r.Reply(false, nil)
+
+	var ctxdone <-chan struct{}
+	if c.Ctx != nil {
+		ctxdone = c.Ctx.Done()
+	}
+	for {
+		select {
+		case r := <-incoming:
+			if r != nil {
+				// This handles keepalive messages and matches
+				// the behaviour of OpenSSH.
+				r.Reply(false, nil)
+			}
+		case <-ctxdone:
+			return
+		case <-c.Conn.Done():
+			return
+		}
 	}
 }
 
 // handleChannelOpens channel open messages from the remote side.
 func (c *Client) handleChannelOpens(in <-chan NewChannel) {
-	for ch := range in {
-		c.mu.Lock()
-		handler := c.channelHandlers[ch.ChannelType()]
-		c.mu.Unlock()
 
-		if handler != nil {
-			handler <- ch
-		} else {
-			ch.Reject(UnknownChannelType, fmt.Sprintf("unknown channel type: %v", ch.ChannelType()))
+	var ctxdone <-chan struct{}
+	if c.Ctx != nil {
+		ctxdone = c.Ctx.Done()
+	}
+	for {
+		select {
+		case <-ctxdone:
+			return
+		case <-c.Conn.Done():
+			return
+		case ch := <-in:
+			if ch != nil {
+				c.mu.Lock()
+				handler := c.channelHandlers[ch.ChannelType()]
+				c.mu.Unlock()
+				if handler != nil {
+					select {
+					case handler <- ch:
+					case <-ctxdone:
+						return
+					case <-c.Conn.Done():
+						return
+					}
+				} else {
+					ch.Reject(UnknownChannelType, fmt.Sprintf("unknown channel type: %v", ch.ChannelType()))
+				}
+			}
 		}
 	}
-
 	c.mu.Lock()
 	for _, ch := range c.channelHandlers {
 		close(ch)

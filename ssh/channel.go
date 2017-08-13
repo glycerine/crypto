@@ -76,6 +76,10 @@ type Channel interface {
 	// safely be read and written from a different goroutine than
 	// Read and Write respectively.
 	Stderr() io.ReadWriter
+
+	// Done can be used to await connection shutdown. The
+	// returned channel will be closed when the Channel is closed.
+	Done() <-chan struct{}
 }
 
 // Request is a request sent outside of the normal stream of
@@ -423,7 +427,11 @@ func (c *channel) handlePacket(packet []byte) error {
 			return err
 		}
 		c.mux.chanList.remove(msg.PeersId)
-		c.msg <- msg
+		select {
+		case c.msg <- msg:
+		case <-c.mux.ctx.Done():
+			return io.EOF
+		}
 	case *channelOpenConfirmMsg:
 		if err := c.responseMessageReceived(); err != nil {
 			return err
@@ -434,7 +442,11 @@ func (c *channel) handlePacket(packet []byte) error {
 		c.remoteId = msg.MyId
 		c.maxRemotePayload = msg.MaxPacketSize
 		c.remoteWin.add(msg.MyWindow)
-		c.msg <- msg
+		select {
+		case c.msg <- msg:
+		case <-c.mux.ctx.Done():
+			return io.EOF
+		}
 	case *windowAdjustMsg:
 		if !c.remoteWin.add(msg.AdditionalBytes) {
 			return fmt.Errorf("ssh: invalid window update for %d bytes", msg.AdditionalBytes)
@@ -446,10 +458,17 @@ func (c *channel) handlePacket(packet []byte) error {
 			Payload:   msg.RequestSpecificData,
 			ch:        c,
 		}
-
-		c.incomingRequests <- &req
+		select {
+		case c.incomingRequests <- &req:
+		case <-c.mux.ctx.Done():
+			return io.EOF
+		}
 	default:
-		c.msg <- msg
+		select {
+		case c.msg <- msg:
+		case <-c.mux.ctx.Done():
+			return io.EOF
+		}
 	}
 	return nil
 }
@@ -566,6 +585,10 @@ func (ch *channel) Stderr() io.ReadWriter {
 	return ch.Extended(1)
 }
 
+func (ch *channel) Done() <-chan struct{} {
+	return ch.mux.ctx.Done()
+}
+
 func (ch *channel) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
 	if !ch.decided {
 		return false, errUndecided
@@ -588,18 +611,24 @@ func (ch *channel) SendRequest(name string, wantReply bool, payload []byte) (boo
 	}
 
 	if wantReply {
-		m, ok := (<-ch.msg)
-		if !ok {
+		select {
+		case <-ch.mux.ctx.Done():
 			return false, io.EOF
+		case m, ok := (<-ch.msg):
+			if !ok {
+				return false, io.EOF
+			}
+			switch m.(type) {
+			case *channelRequestFailureMsg:
+				return false, nil
+			case *channelRequestSuccessMsg:
+				return true, nil
+			default:
+				return false, fmt.Errorf("ssh: unexpected response to channel request: %#v", m)
+			}
+
 		}
-		switch m.(type) {
-		case *channelRequestFailureMsg:
-			return false, nil
-		case *channelRequestSuccessMsg:
-			return true, nil
-		default:
-			return false, fmt.Errorf("ssh: unexpected response to channel request: %#v", m)
-		}
+
 	}
 
 	return false, nil

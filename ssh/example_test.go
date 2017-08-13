@@ -7,6 +7,7 @@ package ssh_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -99,7 +100,7 @@ func ExampleNewServerConn() {
 	log.Printf("logged in with key %s", conn.Permissions.Extensions["pubkey-fp"])
 
 	// The incoming Request channel must be serviced.
-	go ssh.DiscardRequests(reqs)
+	go ssh.DiscardRequests(reqs, context.TODO())
 
 	// Service the incoming Channel channel.
 	for newChannel := range chans {
